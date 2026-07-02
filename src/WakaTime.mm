@@ -44,6 +44,7 @@
 #include <ctime>
 #include <deque>
 #include <sstream>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -62,7 +63,7 @@ static const int   kHeartbeatFrequencyMinutes = 2;
 // System.Timers.Timer interval = 10 000 ms.
 static const double kFlushIntervalSeconds = 10.0;
 
-static const int nbFunc = 2;
+static const int nbFunc = 4;   // Settings | Dashboard | (sep) | About
 
 // Save-button target for the Settings dialog. The full @interface is declared
 // here (before the anonymous namespace) so showSettingsDialog can instantiate it
@@ -101,7 +102,8 @@ dispatch_source_t gTimer = nil;                // _timer
 bool              gInitialized = false;
 bool              gCliMissingWarned = false;   // alert-once guard (macOS-only)
 
-std::string  gApiKey;                          // cached CliParameters.Key
+std::string  gApiKey;                          // cached CliParameters.Key (main thread only)
+std::atomic<bool> gHasApiKey{false};           // cross-thread flag the flush reads (gApiKey non-empty?)
 std::string  gPluginUA;                        // cached CliParameters.Plugin
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,6 +261,9 @@ void cfgSet(const std::string &section, const std::string &key, const std::strin
         for (size_t i = 0; i < lines.size(); ++i) { out += lines[i]; out += "\n"; }
         NSString *data = [NSString stringWithUTF8String:out.c_str()];
         [data writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        // The config holds the plaintext API key — keep it owner-only (0600).
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0600)}
+                                         ofItemAtPath:path error:nil];
     }
 }
 
@@ -338,16 +343,18 @@ std::string cliLocation() {
     // 1. Official install dir ~/.wakatime/  (where `brew`/installer place it).
     std::string p = findCliInDir(resourcesLocation());
     if (!p.empty()) return p;
-    // 2. PATH (login shell).
-    p = whichViaShell("wakatime-cli");
-    if (!p.empty()) return p;
-    // 3. Common Homebrew / local prefixes.
+    // 2. Common Homebrew / local prefixes — cheap filesystem checks, no shell.
     for (const char *dir : { "/opt/homebrew/bin", "/usr/local/bin" }) {
         std::string cand = std::string(dir) + "/wakatime-cli";
         if ([[NSFileManager defaultManager]
                 isExecutableFileAtPath:[NSString stringWithUTF8String:cand.c_str()]])
             return cand;
     }
+    // 3. PATH via a login shell (last resort — exotic setups like asdf shims).
+    //    Spawning a shell is comparatively expensive, so we only reach it after
+    //    the cheap checks above miss.
+    p = whichViaShell("wakatime-cli");
+    if (!p.empty()) return p;
     return std::string();
 }
 
@@ -386,7 +393,10 @@ NSArray<NSString *> *buildCliArgs(const Heartbeat &h, bool hasExtra) {
     auto add = [&](const std::string &s) {
         [a addObject:[NSString stringWithUTF8String:s.c_str()]];
     };
-    add("--key");            add(gApiKey);
+    // The API key is deliberately NOT passed as --key (which would expose it in
+    // `ps`). wakatime-cli reads it from ~/.wakatime.cfg [settings] api_key, which
+    // the Settings dialog writes (0600). homeLocation() honours WAKATIME_HOME just
+    // like wakatime-cli, so both always agree on the config file.
     add("--entity");         add(h.entity);
     add("--lines-in-file");  add(std::to_string(h.lines));
     add("--lineno");         add(std::to_string(h.lineNumber));
@@ -469,7 +479,7 @@ void handleActivity(const std::string &file, bool isWrite) {
 void runCli(const Heartbeat &first, const std::vector<Heartbeat> &extra) {
     std::string binary = cliLocation();
     if (binary.empty()) { warnCliMissingOnce(); return; }
-    if (gApiKey.empty()) return;       // nothing to send without a key
+    if (!gHasApiKey.load()) return;    // nothing to send without a key (thread-safe)
 
     bool hasExtra = !extra.empty();
     @autoreleasepool {
@@ -510,9 +520,17 @@ void runCli(const Heartbeat &first, const std::vector<Heartbeat> &extra) {
             @try { [inH writeData:d]; } @catch (...) {}
             @try { [inH closeFile]; } @catch (...) {}
         }
-        // Drain pipes so the child never blocks on a full pipe, then reap.
+        // Drain both pipes concurrently so the child can't block writing to one
+        // (a full stderr pipe) while we're still reading the other — which would
+        // deadlock the stdout read.
+        NSFileHandle *errH = errPipe.fileHandleForReading;
+        dispatch_semaphore_t errDone = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+            @try { [errH readDataToEndOfFile]; } @catch (...) {}
+            dispatch_semaphore_signal(errDone);
+        });
         [outPipe.fileHandleForReading readDataToEndOfFile];
-        [errPipe.fileHandleForReading readDataToEndOfFile];
+        dispatch_semaphore_wait(errDone, DISPATCH_TIME_FOREVER);
         [task waitUntilExit];
     }
 }
@@ -661,6 +679,7 @@ void showSettingsDialog() {
            self.debugBtn.state == NSControlStateValueOn ? "true" : "false");
     // Refresh the cached key used by the heartbeat sender.
     gApiKey = key;
+    gHasApiKey.store(!gApiKey.empty());
     [NSApp stopModal];
     [self.win close];
 }
@@ -673,6 +692,29 @@ void settingsCommand() {
     showSettingsDialog();
 }
 
+// About dialog — basic info + setup steps.
+void aboutCommand() {
+    @autoreleasepool {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = @"About WakaTime";
+        a.alertStyle  = NSAlertStyleInformational;
+        a.informativeText =
+            @"WakaTime v1.0.0 (macOS port)\n"
+             "Tracks upstream notepadpp-wakatime 5.1.2.\n\n"
+             "Automatic coding-time tracker: it records \"heartbeats\" as you edit "
+             "and sends them to WakaTime via the wakatime-cli helper. View your "
+             "dashboards at wakatime.com.\n\n"
+             "Setup:\n"
+             "1. Install the helper:  brew install wakatime-cli\n"
+             "2. Get your API key:  https://wakatime.com/settings/api-key\n"
+             "3. Enter it in Plugins > WakaTime > Settings.\n\n"
+             "Original Windows plugin by Alan Hamlett / WakaTime (BSD-3-Clause)\n"
+             "macOS port by Andrey Letov";
+        [a addButtonWithTitle:@"OK"];
+        [a runModal];
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Initialize() / timer setup  (WakaTime.cs ctor + Initialize + WakaTimePackage)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -682,6 +724,7 @@ void initializeEngine() {
 
     gQueueLock = [[NSLock alloc] init];
     gApiKey = cfgGet("api_key");
+    gHasApiKey.store(!gApiKey.empty());
 
     // CliParameters.Plugin = "<editor>/<ver> <plugin>/<ver>". We report a fixed
     // editor version (host NPPM_GETNPPVERSION is available but the exact wire
@@ -742,6 +785,12 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
         [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://wakatime.com/dashboard"]];
     };
     funcItem[1]._pShKey = nullptr;
+    strncpy(funcItem[2]._itemName, "---", NPP_MENU_ITEM_SIZE - 1);   // separator
+    funcItem[2]._pFunc = nullptr;
+    funcItem[2]._pShKey = nullptr;
+    strncpy(funcItem[3]._itemName, "About", NPP_MENU_ITEM_SIZE - 1);
+    funcItem[3]._pFunc = aboutCommand;
+    funcItem[3]._pShKey = nullptr;
 }
 
 extern "C" NPP_EXPORT const char *getName() { return PLUGIN_NAME; }
